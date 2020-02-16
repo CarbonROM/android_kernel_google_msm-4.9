@@ -17,9 +17,8 @@
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/slab.h>
-#include <linux/display_state.h>
 
-#define MAPLE_IOSCHED_PATCHLEVEL	(8)
+#define MAPLE_IOSCHED_PATCHLEVEL	(9)
 
 enum { ASYNC, SYNC };
 
@@ -35,8 +34,6 @@ static const int async_write_expire	= 450;
 static const int fifo_batch		= 16;
 /* max times reads can starve a write */	
 static const int writes_starved	= 4;
-/* multple for expire time when device is asleep */
-static const int sleep_latency_multiple = 10;
 
 /* Elevator data */
 struct maple_data {
@@ -51,7 +48,6 @@ struct maple_data {
 	int fifo_expire[2][2];
 	int fifo_batch;
 	int writes_starved;
-	int sleep_latency_multiple;
 };
 
 static inline struct maple_data *
@@ -84,21 +80,13 @@ maple_add_request(struct request_queue *q, struct request *rq)
 	struct maple_data *mdata = maple_get_data(q);
 	const int sync = rq_is_sync(rq);
 	const int dir = rq_data_dir(rq);
-	const bool display_on = is_display_on();
-
-	/* increase expiration when device is asleep */
-	unsigned int fifo_expire_suspended =
-		mdata->fifo_expire[sync][dir] * sleep_latency_multiple;
 
 	/*
 	 * Add request to the proper fifo list and set its
 	 * expire time.
 	 */
-	if (display_on && mdata->fifo_expire[sync][dir]) {
+	if (mdata->fifo_expire[sync][dir]) {
 		rq->fifo_time = jiffies + mdata->fifo_expire[sync][dir];
-		list_add_tail(&rq->queuelist, &mdata->fifo_list[sync][dir]);
-	} else if (!display_on && fifo_expire_suspended) {
-		rq->fifo_time = jiffies + fifo_expire_suspended;
 		list_add_tail(&rq->queuelist, &mdata->fifo_list[sync][dir]);
 	}
 }
@@ -213,7 +201,6 @@ maple_dispatch_requests(struct request_queue *q, int force)
 	struct maple_data *mdata = maple_get_data(q);
 	struct request *rq = NULL;
 	int data_dir = READ;
-	const bool display_on = is_display_on();
 
 	/*
 	 * Retrieve any expired request after a batch of
@@ -225,9 +212,7 @@ maple_dispatch_requests(struct request_queue *q, int force)
 	/* Retrieve request */
 	if (!rq) {
 		/* Treat writes fairly while suspended, otherwise allow them to be starved */
-		if (display_on && mdata->starved >= mdata->writes_starved)
-			data_dir = WRITE;
-		else if (!display_on && mdata->starved >= 1)
+		if (mdata->starved >= mdata->writes_starved)
 			data_dir = WRITE;
 
 		rq = maple_choose_request(mdata, data_dir);
@@ -300,7 +285,6 @@ static int maple_init_queue(struct request_queue *q, struct elevator_type *e)
 	mdata->fifo_expire[ASYNC][WRITE] = async_write_expire;
 	mdata->fifo_batch = fifo_batch;
 	mdata->writes_starved = writes_starved;
-	mdata->sleep_latency_multiple = sleep_latency_multiple;
 
 	spin_lock_irq(q->queue_lock);
 	q->elevator = eq;
@@ -357,8 +341,6 @@ SHOW_FUNCTION(maple_fifo_batch_show,
 	      mdata->fifo_batch, 0);
 SHOW_FUNCTION(maple_writes_starved_show,
 	      mdata->writes_starved, 0);
-SHOW_FUNCTION(maple_sleep_latency_multiple_show,
-	      mdata->sleep_latency_multiple, 0);
 #undef SHOW_FUNCTION
 
 #define STORE_FUNCTION(__FUNC, __PTR, MIN, MAX, __CONV)	\
@@ -390,8 +372,6 @@ STORE_FUNCTION(maple_fifo_batch_store,
 	       &mdata->fifo_batch, 1, INT_MAX, 0);
 STORE_FUNCTION(maple_writes_starved_store,
 	       &mdata->writes_starved, 1, INT_MAX, 0);
-STORE_FUNCTION(maple_sleep_latency_multiple_store,
-	       &mdata->sleep_latency_multiple, 1, INT_MAX, 0);
 #undef STORE_FUNCTION
 
 #define DD_ATTR(name) \
@@ -405,7 +385,6 @@ static struct elv_fs_entry maple_attrs[] = {
 	DD_ATTR(async_write_expire),
 	DD_ATTR(fifo_batch),
 	DD_ATTR(writes_starved),
-	DD_ATTR(sleep_latency_multiple),
 	__ATTR_NULL
 };
 
